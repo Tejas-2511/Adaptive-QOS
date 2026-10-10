@@ -84,6 +84,7 @@ def _compute_group_metrics(pkts: list, simulation_time: float, bandwidth_mbps: f
         for p in delivered
     ])
     avg_latency = float(np.mean(latencies))
+    p99_latency = float(np.percentile(latencies, 99))
 
     # Jitter = mean of absolute successive latency differences
     if len(latencies) > 1:
@@ -101,6 +102,7 @@ def _compute_group_metrics(pkts: list, simulation_time: float, bandwidth_mbps: f
 
     return {
         "avg_latency": round(avg_latency, 3),
+        "p99_latency": round(p99_latency, 3),
         "jitter": round(jitter, 3),
         "packet_loss": round(packet_loss, 2),
         "throughput": round(throughput_mbps, 4),

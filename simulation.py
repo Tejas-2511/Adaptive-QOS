@@ -17,6 +17,9 @@ from qos_algorithms import (
     wfq_schedule,
     cbwfq_schedule,
     adaptive_qos_schedule,
+    MIXES,          # workload mix profiles
+    MULT,           # congestion overload multipliers
+    INIT_SCORE,     # initial congestion score seeds
 )
 from metrics import compute_metrics
 
