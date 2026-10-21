@@ -3,33 +3,44 @@ simulation.py
 -------------
 Handles packet generation and the main simulation loop.
 
-A 'packet' is just a Python dict with fields:
-    packet_id, traffic_type, size (bytes), arrival_time, priority
-
-The simulator feeds packets through a chosen QoS algorithm and
-collects per-packet departure times and drop flags.
+Implements high-performance vectorized scheduling based on the Adaptive QoS
+technical reference (using parallel NumPy arrays for speed and fidelity),
+while maintaining full compatibility with app.py and database.py.
 """
 
+import math
 import random
+from typing import Dict, List, Tuple, Any
+import numpy as np
+
+import qos_algorithms as qa
 from qos_algorithms import (
-    fifo_schedule,
-    pq_schedule,
-    wfq_schedule,
-    cbwfq_schedule,
-    adaptive_qos_schedule,
-    MIXES,          # workload mix profiles
-    MULT,           # congestion overload multipliers
-    INIT_SCORE,     # initial congestion score seeds
+    CLASSES,
+    SIZE_RANGE,
+    WFQ_W,
+    CBWFQ_S,
+    MIXES,
+    MULT,
+    INIT_SCORE,
+    BUFFER,
+    ADAPT_W,
+    generate,
+    fifo,
+    pq,
+    wfq,
+    cbwfq,
+    adaptive,
+    metrics,
+    run_all,
 )
-from metrics import compute_metrics
 
 # ---------------------------------------------------------------------------
-# Traffic type definitions
+# Traffic type definitions (preserved for app.py compatibility)
 # ---------------------------------------------------------------------------
 
 TRAFFIC_TYPES = {
     "Video Conferencing": {
-        "priority": 4,        # highest
+        "priority": 4,              # highest
         "size_range": (100, 300),   # bytes – small real-time packets
         "weight": 4,
         "cbwfq_share": 0.35,
@@ -54,7 +65,7 @@ TRAFFIC_TYPES = {
     },
 }
 
-# How much of the total traffic each type contributes (must sum to 1.0)
+# Default traffic mix proportions
 TRAFFIC_MIX = {
     "Video Conferencing": 0.20,
     "Gaming": 0.25,
@@ -62,19 +73,12 @@ TRAFFIC_MIX = {
     "Background": 0.25,
 }
 
-# Congestion level → offered load multiplier relative to link capacity.
-# Values > 1.0 mean we inject more traffic than the link can drain,
-# which creates real queuing delay and packet drops so that different
-# QoS algorithms produce visibly different results.
-CONGESTION_OVERLOAD = {
-    "Low":      0.55,   # ~55% of capacity – no real stress
-    "Moderate": 1.10,   # 10% overloaded  → noticeable queuing / some drops
-    "High":     1.65,   # 65% overloaded  → heavy drops / large queues
-}
+# Congestion level overload multipliers
+CONGESTION_OVERLOAD = MULT   # {"Low": 0.55, "Moderate": 1.10, "High": 1.65}
 
 
 # ---------------------------------------------------------------------------
-# Packet generation
+# Backward-compatible packet generation (dict-based)
 # ---------------------------------------------------------------------------
 
 def generate_packets(
@@ -83,77 +87,48 @@ def generate_packets(
     traffic_load: float,      # 0-1 UI slider (scales total offered load)
     congestion_level: str,    # "Low" | "Moderate" | "High"
     seed: int = 42,
+    profile: str = "Default",
 ) -> list:
     """
-    Generate a list of packets arriving over [0, simulation_time].
-
-    Offered load = traffic_load * CONGESTION_OVERLOAD[level] * bandwidth.
-    At Moderate/High congestion the offered load intentionally exceeds the
-    link capacity so that queues build up and algorithms are differentiated.
+    Generate a list of packet dicts (for backwards compatibility).
     """
-    rng = random.Random(seed)
-
-    overload = CONGESTION_OVERLOAD.get(congestion_level, 1.10)
-
-    # Total bytes to inject (may exceed what the link can drain)
-    total_bytes_target = (
-        overload * traffic_load * bandwidth_mbps * 1e6 / 8
-        * simulation_time
+    pt, sz, arr = generate(
+        bw=bandwidth_mbps,
+        load=traffic_load,
+        level=congestion_level,
+        sim_time=simulation_time,
+        seed=seed,
+        profile=profile,
     )
-
     packets = []
-    packet_id = 0
-    bytes_generated = 0
-
-    while bytes_generated < total_bytes_target:
-        # Pick traffic type according to mix probabilities
-        traffic_type = rng.choices(
-            list(TRAFFIC_MIX.keys()),
-            weights=list(TRAFFIC_MIX.values()),
-        )[0]
-
-        info = TRAFFIC_TYPES[traffic_type]
-        size = rng.randint(*info["size_range"])
-
-        # Arrival time: uniformly spread over simulation window.
-        # Slightly skew towards earlier arrivals to create initial burst pressure.
-        fraction_done = bytes_generated / max(total_bytes_target, 1)
-        arrival_time = (fraction_done ** 0.85) * simulation_time + rng.uniform(0, 0.002)
-        arrival_time = min(arrival_time, simulation_time)
-
+    for i in range(len(pt)):
+        c_name = CLASSES[int(pt[i])]
         packets.append({
-            "packet_id": packet_id,
-            "traffic_type": traffic_type,
-            "size": size,           # bytes
-            "arrival_time": round(arrival_time, 6),
-            "priority": info["priority"],
+            "packet_id": i,
+            "traffic_type": c_name,
+            "size": int(sz[i]),
+            "arrival_time": round(float(arr[i]), 6),
+            "priority": TRAFFIC_TYPES[c_name]["priority"],
         })
-
-        bytes_generated += size
-        packet_id += 1
-
-    # Sort by arrival time – ensures FIFO ordering is correct
-    packets.sort(key=lambda p: p["arrival_time"])
-
-    # Re-assign sequential IDs after sorting
-    for i, pkt in enumerate(packets):
-        pkt["packet_id"] = i
-
     return packets
+
+
+# ---------------------------------------------------------------------------
+# Algorithm mapping
+# ---------------------------------------------------------------------------
+
+ALGORITHM_MAP = {
+    "FIFO": fifo,
+    "PQ": pq,
+    "WFQ": wfq,
+    "CBWFQ": cbwfq,
+    "Adaptive QoS": adaptive,
+}
 
 
 # ---------------------------------------------------------------------------
 # Main simulation runner
 # ---------------------------------------------------------------------------
-
-ALGORITHM_MAP = {
-    "FIFO": fifo_schedule,
-    "PQ": pq_schedule,
-    "WFQ": wfq_schedule,
-    "CBWFQ": cbwfq_schedule,
-    "Adaptive QoS": adaptive_qos_schedule,
-}
-
 
 def run_simulation(
     algorithm: str,
@@ -162,52 +137,124 @@ def run_simulation(
     traffic_load: float,
     congestion_level: str,
     seed: int = 42,
+    profile: str = "Default",
+    **adaptive_kw,
 ) -> dict:
     """
-    Run a full simulation for a given algorithm and return a results dict.
+    Run a simulation for a given algorithm using the vectorized engine and
+    return a results dict matching app.py and database.py schema.
 
     Returns
     -------
     {
         "per_type": {traffic_type: {metric: value, ...}, ...},
         "overall":  {metric: value, ...},
-        "adaptive_log": [...],   # only for Adaptive QoS
+        "adaptive_log": [...],
+        "total_packets": int,
     }
     """
-    # 1. Generate packets (same seed → fair comparison)
-    packets = generate_packets(
-        simulation_time=simulation_time,
-        bandwidth_mbps=bandwidth_mbps,
-        traffic_load=traffic_load,
-        congestion_level=congestion_level,
+    # 1. Generate packet traces using parallel numpy arrays
+    pt, sz, arr = generate(
+        bw=bandwidth_mbps,
+        load=traffic_load,
+        level=congestion_level,
+        sim_time=simulation_time,
         seed=seed,
+        profile=profile,
     )
 
-    # 2. Schedule packets through the chosen QoS algorithm
-    schedule_fn = ALGORITHM_MAP[algorithm]
-    scheduled = schedule_fn(
-        packets=packets,
-        bandwidth_mbps=bandwidth_mbps,
-        simulation_time=simulation_time,
-        congestion_level=congestion_level,
-    )
+    adaptive_meta = None
 
-    # scheduled is a list of dicts:
-    # {packet_id, traffic_type, size, arrival_time, priority,
-    #  departure_time, dropped}
-    # Plus optional "adaptive_log" key on the returned tuple.
-
-    adaptive_log = []
-    if isinstance(scheduled, tuple):
-        scheduled, adaptive_log = scheduled
+    # 2. Schedule packets using the vectorized algorithms
+    if algorithm == "FIFO":
+        dep = fifo(pt, sz, arr, bandwidth_mbps)
+    elif algorithm == "PQ":
+        dep = pq(pt, sz, arr, bandwidth_mbps)
+    elif algorithm == "WFQ":
+        dep = wfq(pt, sz, arr, bandwidth_mbps)
+    elif algorithm == "CBWFQ":
+        dep = cbwfq(pt, sz, arr, bandwidth_mbps)
+    elif algorithm == "Adaptive QoS":
+        dep, adaptive_meta = adaptive(
+            pt, sz, arr, bandwidth_mbps, congestion_level, **adaptive_kw
+        )
+    else:
+        raise ValueError(f"Unknown QoS algorithm: '{algorithm}'")
 
     # 3. Compute metrics
-    results = compute_metrics(
-        scheduled_packets=scheduled,
-        simulation_time=simulation_time,
-        bandwidth_mbps=bandwidth_mbps,
-    )
-    results["adaptive_log"] = adaptive_log
-    results["total_packets"] = len(packets)
+    m_raw = metrics(pt, sz, arr, dep, bandwidth_mbps, simulation_time)
+
+    # 4. Format metrics for dashboard & database storage
+    per_type = {}
+    for c_name in CLASSES:
+        cm = m_raw.get(c_name, {})
+        n = int(cm.get("n", 0))
+        loss = float(cm.get("loss", 0.0))
+        deliv = int(round((1.0 - loss / 100.0) * n))
+        lat = cm.get("lat", 0.0)
+        p99 = cm.get("p99", 0.0)
+
+        per_type[c_name] = {
+            "avg_latency": round(lat, 3) if not (math.isnan(lat) or math.isinf(lat)) else 0.0,
+            "p99_latency": round(p99, 3) if not (math.isnan(p99) or math.isinf(p99)) else 0.0,
+            "jitter": round(float(cm.get("jit", 0.0)), 3),
+            "packet_loss": round(loss, 2),
+            "throughput": round(float(cm.get("thr", 0.0)), 4),
+            "bw_utilization": round(float(cm.get("util", 0.0)), 2),
+            "total_packets": n,
+            "delivered_packets": deliv,
+            "dropped_packets": n - deliv,
+        }
+
+    ov = m_raw.get("Overall", {})
+    ov_n = int(ov.get("n", 0))
+    ov_loss = float(ov.get("loss", 0.0))
+    ov_deliv = int(round((1.0 - ov_loss / 100.0) * ov_n))
+    ov_lat = ov.get("lat", 0.0)
+    ov_p99 = ov.get("p99", 0.0)
+
+    overall = {
+        "avg_latency": round(ov_lat, 3) if not (math.isnan(ov_lat) or math.isinf(ov_lat)) else 0.0,
+        "p99_latency": round(ov_p99, 3) if not (math.isnan(ov_p99) or math.isinf(ov_p99)) else 0.0,
+        "jitter": round(float(ov.get("jit", 0.0)), 3),
+        "packet_loss": round(ov_loss, 2),
+        "throughput": round(float(ov.get("thr", 0.0)), 4),
+        "bw_utilization": round(float(ov.get("util", 0.0)), 2),
+        "total_packets": ov_n,
+        "delivered_packets": ov_deliv,
+        "dropped_packets": ov_n - ov_deliv,
+    }
+
+    adaptive_log = []
+    if adaptive_meta and "log" in adaptive_meta:
+        for entry in adaptive_meta["log"]:
+            # entry format: (t, score, lev, strict, bw_pct, loss_pct, avg_lat)
+            t, score, lev, strict, bw_pct, loss_pct, avg_lat = entry
+            w_tuple = ADAPT_W.get(lev, (4, 3, 2, 1))
+            adaptive_log.append({
+                "time": round(float(t), 4),
+                "congestion_score": round(float(score), 4),
+                "weights": {
+                    "Video Conferencing": w_tuple[0],
+                    "Gaming": w_tuple[1],
+                    "Video Streaming": w_tuple[2],
+                    "Background": w_tuple[3],
+                },
+                "strict_priority": bool(strict),
+                "bw_utilization": round(float(bw_pct), 2),
+                "packet_loss": round(float(loss_pct), 2),
+                "avg_latency": round(float(avg_lat), 3),
+            })
+
+    results = {
+        "per_type": per_type,
+        "overall": overall,
+        "adaptive_log": adaptive_log,
+        "total_packets": len(pt),
+    }
+
+    if adaptive_meta:
+        results["switches"] = adaptive_meta.get("switches", 0)
+        results["evicted"] = adaptive_meta.get("evicted", 0)
 
     return results

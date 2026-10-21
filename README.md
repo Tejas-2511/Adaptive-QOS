@@ -11,13 +11,13 @@
 | File | Purpose |
 |------|---------|
 | `app.py` | Streamlit dashboard — main entry point |
-| `simulation.py` | Packet generation and simulation loop |
-| `qos_algorithms.py` | FIFO, PQ, WFQ, CBWFQ, Adaptive QoS implementations |
-| `metrics.py` | Latency, jitter, packet loss, throughput calculations |
+| `simulation.py` | High-performance vectorized packet generation and simulation loop |
+| `qos_algorithms.py` | Vectorized FIFO, PQ, WFQ, CBWFQ, Adaptive QoS schedulers & metrics |
 | `database.py` | SQLite read/write helpers |
 | `requirements.txt` | Python dependencies |
 | `TECHNICAL.md` | Full technical reference |
 | `qos_results.db` | Auto-created SQLite database |
+| `new/` | Standalone batch experiment suite (E1–E6, statistical analysis & figures) |
 
 ---
 

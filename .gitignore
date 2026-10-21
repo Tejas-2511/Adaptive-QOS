@@ -1,0 +1,16 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Transient experiment cache
+*.pkl
+
+# OS files
+.DS_Store
+Thumbs.db
